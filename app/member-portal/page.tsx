@@ -1,6 +1,7 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, Suspense } from 'react';
+import { useSearchParams } from 'next/navigation';
 import { supabase } from '@/lib/supabaseClient';
 
 // Handwritten Ledger Chit Schedule
@@ -19,68 +20,118 @@ const MONTHLY_CHIT_SCHEDULE = [
   { month: 12, due: 8750, payout: 100000 },
 ];
 
-export default function MemberPortalPage() {
-  const [memberId, setMemberId] = useState<string>('');
-  const [memberName, setMemberName] = useState<string>('Participant');
-  const [payments, setPayments] = useState<any[]>([]);
-  const [isUploading, setIsUploading] = useState<boolean>(false);
-  const [isMounted, setIsMounted] = useState<boolean>(false);
+interface PortalMember {
+  id: string;
+  full_name: string;
+  phone_number: string;
+}
 
-  // Fetch real member data directly on mount
+interface PortalPayment {
+  id: string;
+  member_id: string;
+  group_id: string | null;
+  month_number: number;
+  amount_paid: number;
+  payment_mode: string;
+  status: string;
+}
+
+function MemberPortalInner() {
+  const searchParams = useSearchParams();
+
+  const phone = (searchParams.get('phone') || '').replace(/\D/g, '').slice(-10);
+
+  const [loading, setLoading] = useState<boolean>(phone.length > 0);
+  const [error, setError] = useState<string | null>(
+    phone.length > 0
+      ? null
+      : 'No phone number provided. Please open the link sent to you on WhatsApp, or contact the admin.'
+  );
+  const [member, setMember] = useState<PortalMember | null>(null);
+  const [payments, setPayments] = useState<PortalPayment[]>([]);
+  const [batchNames, setBatchNames] = useState<string[]>([]);
+  const [isUploading, setIsUploading] = useState<boolean>(false);
+  const [selectedMonth, setSelectedMonth] = useState<number>(1);
+
   useEffect(() => {
-    setIsMounted(true);
+    if (!phone) {
+      return;
+    }
 
     const loadMemberData = async () => {
       try {
-        const { data: memberData } = await supabase
+        const { data: memberData, error: memberError } = await supabase
           .from('members')
-          .select('id, name')
-          .limit(1)
+          .select('id, full_name, phone_number')
+          .eq('phone_number', phone)
           .maybeSingle();
 
-        if (memberData?.id) {
-          setMemberId(memberData.id);
-          setMemberName(memberData.name || 'Participant 1');
+        if (memberError) throw memberError;
 
-          const { data: paymentData } = await supabase
-            .from('member_payments')
-            .select('*')
-            .eq('member_id', memberData.id);
-
-          if (paymentData) {
-            setPayments(paymentData);
-          }
+        if (!memberData) {
+          setError('No account found for this phone number. Please contact the admin.');
+          return;
         }
+
+        setMember(memberData);
+
+        const { data: enrollments } = await supabase
+          .from('group_enrollments')
+          .select('group_id')
+          .eq('member_id', memberData.id);
+
+        const groupIds = (enrollments || []).map((e) => e.group_id);
+        if (groupIds.length > 0) {
+          const { data: groups } = await supabase
+            .from('chit_groups')
+            .select('group_name')
+            .in('id', groupIds);
+          setBatchNames((groups || []).map((g) => g.group_name));
+        }
+
+        const { data: paymentData } = await supabase
+          .from('member_payments')
+          .select('*')
+          .eq('member_id', memberData.id)
+          .order('created_at', { ascending: false });
+
+        setPayments(paymentData || []);
+
+        const nextUnpaid =
+          MONTHLY_CHIT_SCHEDULE.find((s) => {
+            const monthSum = (paymentData || [])
+              .filter((p) => p.month_number === s.month)
+              .reduce((sum, p) => sum + (Number(p.amount_paid) || 0), 0);
+            return monthSum < s.due;
+          }) || MONTHLY_CHIT_SCHEDULE[0];
+        setSelectedMonth(nextUnpaid.month);
       } catch (err) {
         console.error('Database fetch error:', err);
+        setError('Could not load your account. Please try again later.');
+      } finally {
+        setLoading(false);
       }
     };
 
     loadMemberData();
-  }, []);
+  }, [phone]);
 
-  const totalPaidSum = payments.reduce(
-    (sum, p) => sum + (Number(p.amount_paid) || 0),
-    0
-  );
+  const totalPaidSum = payments.reduce((sum, p) => sum + (Number(p.amount_paid) || 0), 0);
 
-  const formatINR = (val: number) => {
-    if (!isMounted) return val.toString();
-    return val.toLocaleString('en-IN');
-  };
+  const formatINR = (val: number) => val.toLocaleString('en-IN');
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    if (!member) return;
 
     setIsUploading(true);
 
     try {
       const formData = new FormData();
       formData.append('file', file);
-      if (memberId) {
-        formData.append('memberId', memberId);
-      }
+      formData.append('memberId', member.id);
+      formData.append('month', String(selectedMonth));
 
       const res = await fetch('/api/ai-agent/scan-receipt', {
         method: 'POST',
@@ -93,32 +144,56 @@ export default function MemberPortalPage() {
         alert(`Receipt Scanning Error: ${data.error || 'Failed to scan screenshot'}`);
       } else {
         alert(data.message || 'Receipt scanned successfully!');
-        
-        // Sync the returned valid memberId & reload payments
-        const activeId = data.memberId || memberId;
-        if (activeId) {
-          setMemberId(activeId);
-          const { data: updatedPayments } = await supabase
-            .from('member_payments')
-            .select('*')
-            .eq('member_id', activeId);
 
-          if (updatedPayments) {
-            setPayments(updatedPayments);
-          }
+        const { data: updatedPayments } = await supabase
+          .from('member_payments')
+          .select('*')
+          .eq('member_id', member.id)
+          .order('created_at', { ascending: false });
+
+        if (updatedPayments) {
+          setPayments(updatedPayments);
         }
       }
-    } catch (err: any) {
-      alert(`Upload Error: ${err.message}`);
+    } catch (err) {
+      alert(
+        'Upload Error: ' + (err instanceof Error ? err.message : String(err))
+      );
     } finally {
       setIsUploading(false);
+      e.target.value = '';
     }
   };
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-slate-50/60 flex items-center justify-center font-bold text-slate-600">
+        Loading your account...
+      </div>
+    );
+  }
+
+  if (error || !member) {
+    return (
+      <div className="min-h-screen bg-slate-50/60 flex items-center justify-center p-6">
+        <div className="bg-white p-8 rounded-2xl border border-slate-200/80 shadow-sm max-w-md text-center">
+          <span className="text-4xl">😕</span>
+          <h1 className="text-xl font-black text-slate-900 mt-4">Member Portal</h1>
+          <p className="text-sm text-slate-600 mt-2">
+            {error ||
+              'Could not load your account. Please try again later or contact the admin.'}
+          </p>
+          <p className="text-xs text-slate-400 mt-4">
+            Please open the WhatsApp link shared by your chit fund admin.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-slate-50/60 p-4 md:p-8 font-sans text-slate-800">
       <div className="max-w-5xl mx-auto space-y-6">
-        
         {/* Header Section */}
         <div className="bg-white/80 backdrop-blur-md p-6 rounded-2xl border border-slate-200/80 shadow-sm flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
           <div>
@@ -126,11 +201,23 @@ export default function MemberPortalPage() {
               Member Portal
             </span>
             <h1 className="text-2xl font-black text-slate-900 mt-2">
-              Welcome, {memberName} 👋
+              Welcome, {member.full_name} 👋
             </h1>
             <p className="text-xs font-semibold text-slate-500 mt-0.5">
               Upload your payment screenshots and track your monthly due status.
             </p>
+            {batchNames.length > 0 && (
+              <div className="flex flex-wrap gap-1.5 mt-2">
+                {batchNames.map((name, idx) => (
+                  <span
+                    key={idx}
+                    className="text-[10px] bg-slate-100 text-slate-700 font-bold px-2 py-0.5 rounded border"
+                  >
+                    {name}
+                  </span>
+                ))}
+              </div>
+            )}
           </div>
 
           <div className="bg-slate-900 text-white px-4 py-2.5 rounded-xl shadow-sm flex items-center gap-3">
@@ -141,26 +228,46 @@ export default function MemberPortalPage() {
 
         {/* Upload Receipt Section */}
         <div className="bg-white p-6 rounded-2xl border border-slate-200/80 shadow-sm">
-          <div className="mb-4">
-            <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
-              📥 Upload Monthly Payment Screenshot
-            </h2>
-            <p className="text-xs font-medium text-slate-500">
-              Our AI will scan your screenshot and verify the exact amount paid.
-            </p>
+          <div className="mb-4 flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+            <div>
+              <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                📥 Upload Monthly Payment Screenshot
+              </h2>
+              <p className="text-xs font-medium text-slate-500">
+                Our AI will scan your screenshot and verify the exact amount paid.
+              </p>
+            </div>
+            <div>
+              <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">
+                Payment For Month
+              </label>
+              <select
+                value={selectedMonth}
+                onChange={(e) => setSelectedMonth(Number(e.target.value))}
+                className="p-2.5 border border-slate-300 rounded-xl text-sm font-semibold text-slate-800 bg-white"
+              >
+                {MONTHLY_CHIT_SCHEDULE.map((s) => (
+                  <option key={s.month} value={s.month}>
+                    Month {s.month} (Due: ₹{formatINR(s.due)})
+                  </option>
+                ))}
+              </select>
+            </div>
           </div>
 
-          <label className={`block border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-all ${
-            isUploading 
-              ? 'bg-amber-50/50 border-amber-300' 
-              : 'bg-slate-50/50 hover:bg-slate-100/80 border-slate-300 hover:border-indigo-400'
-          }`}>
-            <input 
-              type="file" 
-              accept="image/*" 
+          <label
+            className={`block border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-all ${
+              isUploading
+                ? 'bg-amber-50/50 border-amber-300'
+                : 'bg-slate-50/50 hover:bg-slate-100/80 border-slate-300 hover:border-indigo-400'
+            }`}
+          >
+            <input
+              type="file"
+              accept="image/*"
               onChange={handleFileUpload}
               disabled={isUploading}
-              className="hidden" 
+              className="hidden"
             />
 
             {isUploading ? (
@@ -197,8 +304,11 @@ export default function MemberPortalPage() {
 
           <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
             {MONTHLY_CHIT_SCHEDULE.map((s) => {
-              const monthPayments = payments.filter(p => p.month_number === s.month);
-              const monthPaidSum = monthPayments.reduce((sum, p) => sum + (Number(p.amount_paid) || 0), 0);
+              const monthPayments = payments.filter((p) => p.month_number === s.month);
+              const monthPaidSum = monthPayments.reduce(
+                (sum, p) => sum + (Number(p.amount_paid) || 0),
+                0
+              );
 
               const isFullyPaid = monthPaidSum >= s.due;
               const isPartial = monthPaidSum > 0 && monthPaidSum < s.due;
@@ -206,11 +316,11 @@ export default function MemberPortalPage() {
               const remainingMonthBalance = s.due - monthPaidSum;
 
               return (
-                <div 
-                  key={s.month} 
+                <div
+                  key={s.month}
                   className={`p-3.5 rounded-xl border text-xs transition-all ${
-                    isFullyPaid 
-                      ? 'bg-emerald-50/70 border-emerald-300/80' 
+                    isFullyPaid
+                      ? 'bg-emerald-50/70 border-emerald-300/80'
                       : isPartial
                       ? 'bg-amber-50/70 border-amber-300/80'
                       : 'bg-slate-50/70 border-slate-200/80'
@@ -218,7 +328,7 @@ export default function MemberPortalPage() {
                 >
                   <div className="flex justify-between items-center font-bold mb-2">
                     <span className="text-slate-800">Month {s.month}</span>
-                    
+
                     {isFullyPaid && (
                       <span className="text-emerald-800 bg-emerald-200/80 px-2 py-0.5 rounded text-[10px] font-extrabold">
                         ✓ PAID
@@ -265,8 +375,21 @@ export default function MemberPortalPage() {
             })}
           </div>
         </div>
-
       </div>
     </div>
+  );
+}
+
+export default function MemberPortalPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="min-h-screen bg-slate-50/60 flex items-center justify-center font-bold text-slate-600">
+          Loading your account...
+        </div>
+      }
+    >
+      <MemberPortalInner />
+    </Suspense>
   );
 }

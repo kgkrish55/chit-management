@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { supabase } from '@/lib/supabaseClient';
 import { useRouter } from 'next/navigation';
 
@@ -20,89 +20,182 @@ const MONTHLY_CHIT_SCHEDULE = [
   { month: 12, duePerPerson: 8750, winnerPayout: 100000 },
 ];
 
+interface Member {
+  id: string;
+  full_name: string;
+  phone_number: string;
+  created_at?: string;
+}
+
+interface Batch {
+  id: string;
+  group_name: string;
+  start_date: string | null;
+  due_day: number | null;
+}
+
+interface Enrollment {
+  id: string;
+  member_id: string;
+  group_id: string;
+}
+
+interface Payment {
+  id: string;
+  member_id: string;
+  group_id: string | null;
+  month_number: number;
+  amount_paid: number;
+  payment_mode: string;
+  receipt_utr: string | null;
+  status: string;
+  members?: { full_name: string; phone_number: string } | null;
+  chit_groups?: { group_name: string } | null;
+}
+
+function getErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
+
+interface BatchSettingsFormProps {
+  batch: Batch;
+  onSaved: () => Promise<void>;
+}
+
+function BatchSettingsForm({ batch, onSaved }: BatchSettingsFormProps) {
+  const [startDate, setStartDate] = useState(batch.start_date || '2025-01-10');
+  const [dueDay, setDueDay] = useState<number>(batch.due_day || 10);
+  const [saving, setSaving] = useState(false);
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      const { error } = await supabase
+        .from('chit_groups')
+        .update({ start_date: startDate, due_day: Number(dueDay) })
+        .eq('id', batch.id);
+
+      if (error) throw error;
+
+      alert(`✅ Updated Batch Start Date to ${startDate}!`);
+      await onSaved();
+    } catch (err) {
+      alert('Error updating batch: ' + getErrorMessage(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="bg-slate-50 p-4 rounded-xl border border-gray-300 flex flex-wrap gap-3 items-end">
+      <div>
+        <label className="block text-[10px] font-bold uppercase text-slate-600 mb-1">
+          Batch Start Date
+        </label>
+        <input
+          type="date"
+          value={startDate}
+          onChange={(e) => setStartDate(e.target.value)}
+          className="p-2 border border-gray-300 rounded-lg text-xs font-bold bg-white text-slate-900"
+        />
+      </div>
+      <div>
+        <label className="block text-[10px] font-bold uppercase text-slate-600 mb-1">Due Day</label>
+        <input
+          type="number"
+          min={1}
+          max={31}
+          value={dueDay}
+          onChange={(e) => setDueDay(Number(e.target.value))}
+          className="p-2 border border-gray-300 rounded-lg text-xs font-bold bg-white text-slate-900 w-20"
+        />
+      </div>
+      <button
+        onClick={handleSave}
+        disabled={saving}
+        className="bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold px-4 py-2 rounded-lg"
+      >
+        {saving ? 'Saving...' : 'Set Date'}
+      </button>
+    </div>
+  );
+}
+
 export default function AdminDashboard() {
   const router = useRouter();
   const [activeTab, setActiveTab] = useState<'batches' | 'members' | 'receipts'>('batches');
   
-  const [members, setMembers] = useState<any[]>([]);
-  const [batches, setBatches] = useState<any[]>([]);
-  const [enrollments, setEnrollments] = useState<any[]>([]);
-  const [payments, setPayments] = useState<any[]>([]);
+  const [members, setMembers] = useState<Member[]>([]);
+  const [batches, setBatches] = useState<Batch[]>([]);
+  const [enrollments, setEnrollments] = useState<Enrollment[]>([]);
+  const [payments, setPayments] = useState<Payment[]>([]);
   const [loading, setLoading] = useState(true);
+  const [dataError, setDataError] = useState('');
 
   const [selectedBatchId, setSelectedBatchId] = useState<string>('batch-1');
-  const [selectedMember, setSelectedMember] = useState<any | null>(null);
+  const [selectedMember, setSelectedMember] = useState<Member | null>(null);
 
   // Form & Cash Payment States
   const [newMember, setNewMember] = useState({ name: '', phone: '', batchId: 'batch-1' });
-  const [cashPayModal, setCashPayModal] = useState<{ open: boolean; member: any | null }>({ open: false, member: null });
+  const [cashPayModal, setCashPayModal] = useState<{ open: boolean; member: Member | null }>({ open: false, member: null });
   const [cashAmount, setCashAmount] = useState<number>(6500);
   const [cashMonth, setCashMonth] = useState<number>(1);
 
-  // Batch Setting State
-  const [batchStartDate, setBatchStartDate] = useState<string>('2025-01-10');
-  const [batchDueDay, setBatchDueDay] = useState<number>(10);
-  const [savingBatch, setSavingBatch] = useState(false);
-
-  useEffect(() => {
-    checkUser();
-    fetchData();
-  }, []);
-
-  useEffect(() => {
-    const currentBatch = batches.find(b => b.id === selectedBatchId);
-    if (currentBatch) {
-      setBatchStartDate(currentBatch.start_date || '2025-01-10');
-      setBatchDueDay(currentBatch.due_day || 10);
-    }
-  }, [selectedBatchId, batches]);
-
-  async function checkUser() {
+  const fetchData = useCallback(async () => {
     try {
-      const { data: { session } } = await supabase.auth.getSession();
-      if (!session) router.push('/login');
-    } catch (err) {
-      console.error("Auth error:", err);
-    }
-  }
+      const { data: membersData, error: membersError } = await supabase.from('members').select('*').order('created_at', { ascending: false });
+      const { data: batchesData, error: batchesError } = await supabase.from('chit_groups').select('*').order('id', { ascending: true });
+      const { data: enrollmentsData, error: enrollmentsError } = await supabase.from('group_enrollments').select('*');
+      const { data: paymentsData, error: paymentsError } = await supabase.from('member_payments').select('*, members(full_name, phone_number), chit_groups(group_name)');
 
-  async function fetchData() {
-    setLoading(true);
-    try {
-      const { data: membersData } = await supabase.from('members').select('*').order('created_at', { ascending: false });
-      const { data: batchesData } = await supabase.from('chit_groups').select('*').order('id', { ascending: true });
-      const { data: enrollmentsData } = await supabase.from('group_enrollments').select('*');
-      const { data: paymentsData } = await supabase.from('member_payments').select('*, members(full_name, phone_number), chit_groups(group_name)');
+      const firstError = membersError || batchesError || enrollmentsError || paymentsError;
+      if (firstError) {
+        setDataError(firstError.message);
+        return;
+      }
 
       if (membersData) setMembers(membersData);
       if (batchesData) setBatches(batchesData);
       if (enrollmentsData) setEnrollments(enrollmentsData);
       if (paymentsData) setPayments(paymentsData);
+      setDataError('');
     } catch (err) {
       console.error("Error fetching data:", err);
+      setDataError(getErrorMessage(err) || 'Failed to load dashboard data.');
     } finally {
       setLoading(false);
     }
-  }
+  }, []);
 
-  const handleUpdateBatchSettings = async () => {
-    setSavingBatch(true);
+  const checkSession = useCallback(async () => {
     try {
-      const { error } = await supabase
-        .from('chit_groups')
-        .update({ start_date: batchStartDate, due_day: Number(batchDueDay) })
-        .eq('id', selectedBatchId);
-
-      if (error) throw error;
-
-      alert(`✅ Updated Batch Start Date to ${batchStartDate}!`);
-      await fetchData();
-    } catch (err: any) {
-      alert('Error updating batch: ' + err.message);
-    } finally {
-      setSavingBatch(false);
+      const res = await fetch('/api/auth/session', { cache: 'no-store' });
+      const data = await res.json();
+      if (!data.authenticated) router.replace('/login');
+    } catch (err) {
+      console.error("Session check error:", err);
     }
-  };
+  }, [router]);
+
+  useEffect(() => {
+    const load = async () => {
+      await Promise.resolve();
+      checkSession();
+      fetchData();
+    };
+    load();
+  }, [checkSession, fetchData]);
+
+  async function handleLogout() {
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' });
+    } catch (err) {
+      console.error("Logout error:", err);
+    }
+    router.push('/login');
+    router.refresh();
+  }
 
   const handleAddMember = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -111,7 +204,7 @@ export default function AdminDashboard() {
     const cleanPhone = newMember.phone.trim().replace(/\D/g, '').slice(-10);
 
     try {
-      let { data: existingMember } = await supabase
+      const { data: existingMember } = await supabase
         .from('members')
         .select('id')
         .eq('phone_number', cleanPhone)
@@ -150,8 +243,8 @@ export default function AdminDashboard() {
 
       setNewMember({ name: '', phone: '', batchId: 'batch-1' });
       await fetchData();
-    } catch (err: any) {
-      alert('Error: ' + err.message);
+    } catch (err) {
+      alert('Error: ' + getErrorMessage(err));
     }
   };
 
@@ -176,8 +269,8 @@ export default function AdminDashboard() {
       alert(`✅ Cash payment of ₹${cashAmount} recorded for Month ${cashMonth}!`);
       setCashPayModal({ open: false, member: null });
       await fetchData();
-    } catch (err: any) {
-      alert('Error recording cash payment: ' + err.message);
+    } catch (err) {
+      alert('Error recording cash payment: ' + getErrorMessage(err));
     }
   };
 
@@ -219,7 +312,7 @@ Reply HELP if you need assistance.`;
   const membersInSelectedBatch = enrollments
     .filter(e => e.group_id === selectedBatchObj?.id)
     .map(e => members.find(m => m.id === e.member_id))
-    .filter(Boolean);
+    .filter((m): m is Member => Boolean(m));
 
   return (
     <div className="min-h-screen bg-slate-100 font-sans pb-12 text-slate-900">
@@ -230,13 +323,19 @@ Reply HELP if you need assistance.`;
             <h1 className="text-2xl font-black tracking-tight">CHIT ADMIN COMMAND CENTER</h1>
             <p className="text-xs text-slate-400">1 Lakh (12-Month) Chit Fund Management System</p>
           </div>
-          <button onClick={async () => { await supabase.auth.signOut(); router.push('/login'); }} className="bg-red-600 hover:bg-red-700 text-xs font-bold px-4 py-2 rounded-lg text-white">
+          <button onClick={handleLogout} className="bg-red-600 hover:bg-red-700 text-xs font-bold px-4 py-2 rounded-lg text-white">
             Logout
           </button>
         </div>
       </header>
 
       <div className="max-w-7xl mx-auto px-6 mt-8">
+        {dataError && (
+          <div className="bg-red-50 border border-red-300 text-red-800 text-sm font-semibold px-4 py-3 rounded-xl mb-6">
+            ⚠️ Could not load data: {dataError}
+          </div>
+        )}
+
         {/* Navigation Tabs */}
         <div className="flex gap-4 border-b border-gray-300 pb-4 mb-8">
           <button onClick={() => setActiveTab('batches')} className={`px-5 py-2.5 rounded-xl font-bold text-sm transition ${activeTab === 'batches' ? 'bg-slate-900 text-white shadow' : 'bg-white text-slate-700 hover:bg-slate-200'}`}>
@@ -281,35 +380,11 @@ Reply HELP if you need assistance.`;
                   </div>
 
                   {/* Batch Start Date Config */}
-                  <div className="bg-slate-50 p-4 rounded-xl border border-gray-300 flex flex-wrap gap-3 items-end">
-                    <div>
-                      <label className="block text-[10px] font-bold uppercase text-slate-600 mb-1">Batch Start Date</label>
-                      <input
-                        type="date"
-                        value={batchStartDate}
-                        onChange={(e) => setBatchStartDate(e.target.value)}
-                        className="p-2 border border-gray-300 rounded-lg text-xs font-bold bg-white text-slate-900"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-[10px] font-bold uppercase text-slate-600 mb-1">Due Day</label>
-                      <input
-                        type="number"
-                        min={1}
-                        max={31}
-                        value={batchDueDay}
-                        onChange={(e) => setBatchDueDay(Number(e.target.value))}
-                        className="p-2 border border-gray-300 rounded-lg text-xs font-bold bg-white text-slate-900 w-20"
-                      />
-                    </div>
-                    <button
-                      onClick={handleUpdateBatchSettings}
-                      disabled={savingBatch}
-                      className="bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold px-4 py-2 rounded-lg"
-                    >
-                      {savingBatch ? 'Saving...' : 'Set Date'}
-                    </button>
-                  </div>
+                  <BatchSettingsForm
+                    key={selectedBatchObj.id}
+                    batch={selectedBatchObj}
+                    onSaved={fetchData}
+                  />
                 </div>
 
                 {/* Participants Table */}
@@ -331,7 +406,7 @@ Reply HELP if you need assistance.`;
                           <td colSpan={6} className="py-8 text-center text-slate-500">No participants enrolled in this batch yet.</td>
                         </tr>
                       ) : (
-                        membersInSelectedBatch.map((m: any) => {
+                        membersInSelectedBatch.map((m) => {
                           const stats = getMemberPaidStats(m.id, selectedBatchObj.id);
                           return (
                             <tr key={m.id} className="hover:bg-slate-50 transition">
