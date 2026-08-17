@@ -1,65 +1,585 @@
-import Image from "next/image";
+'use client';
 
-export default function Home() {
+import { useState, useEffect } from 'react';
+import { supabase } from '@/lib/supabaseClient';
+import { useRouter } from 'next/navigation';
+
+// Exact Chit Schedule matching handwritten ledger
+const MONTHLY_CHIT_SCHEDULE = [
+  { month: 1, duePerPerson: 6500, winnerPayout: 72000 },
+  { month: 2, duePerPerson: 6600, winnerPayout: 74000 },
+  { month: 3, duePerPerson: 6750, winnerPayout: 76000 },
+  { month: 4, duePerPerson: 7000, winnerPayout: 78000 },
+  { month: 5, duePerPerson: 7100, winnerPayout: 80000 },
+  { month: 6, duePerPerson: 7350, winnerPayout: 83000 },
+  { month: 7, duePerPerson: 7600, winnerPayout: 86000 },
+  { month: 8, duePerPerson: 7800, winnerPayout: 89000 },
+  { month: 9, duePerPerson: 8100, winnerPayout: 92000 },
+  { month: 10, duePerPerson: 8350, winnerPayout: 95000 },
+  { month: 11, duePerPerson: 8600, winnerPayout: 98000 },
+  { month: 12, duePerPerson: 8750, winnerPayout: 100000 },
+];
+
+export default function AdminDashboard() {
+  const router = useRouter();
+  const [activeTab, setActiveTab] = useState<'batches' | 'members' | 'receipts'>('batches');
+  
+  const [members, setMembers] = useState<any[]>([]);
+  const [batches, setBatches] = useState<any[]>([]);
+  const [enrollments, setEnrollments] = useState<any[]>([]);
+  const [payments, setPayments] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  const [selectedBatchId, setSelectedBatchId] = useState<string>('batch-1');
+  const [selectedMember, setSelectedMember] = useState<any | null>(null);
+
+  // Form & Cash Payment States
+  const [newMember, setNewMember] = useState({ name: '', phone: '', batchId: 'batch-1' });
+  const [cashPayModal, setCashPayModal] = useState<{ open: boolean; member: any | null }>({ open: false, member: null });
+  const [cashAmount, setCashAmount] = useState<number>(6500);
+  const [cashMonth, setCashMonth] = useState<number>(1);
+
+  // Batch Setting State
+  const [batchStartDate, setBatchStartDate] = useState<string>('2025-01-10');
+  const [batchDueDay, setBatchDueDay] = useState<number>(10);
+  const [savingBatch, setSavingBatch] = useState(false);
+
+  useEffect(() => {
+    checkUser();
+    fetchData();
+  }, []);
+
+  useEffect(() => {
+    const currentBatch = batches.find(b => b.id === selectedBatchId);
+    if (currentBatch) {
+      setBatchStartDate(currentBatch.start_date || '2025-01-10');
+      setBatchDueDay(currentBatch.due_day || 10);
+    }
+  }, [selectedBatchId, batches]);
+
+  async function checkUser() {
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) router.push('/login');
+    } catch (err) {
+      console.error("Auth error:", err);
+    }
+  }
+
+  async function fetchData() {
+    setLoading(true);
+    try {
+      const { data: membersData } = await supabase.from('members').select('*').order('created_at', { ascending: false });
+      const { data: batchesData } = await supabase.from('chit_groups').select('*').order('id', { ascending: true });
+      const { data: enrollmentsData } = await supabase.from('group_enrollments').select('*');
+      const { data: paymentsData } = await supabase.from('member_payments').select('*, members(full_name, phone_number), chit_groups(group_name)');
+
+      if (membersData) setMembers(membersData);
+      if (batchesData) setBatches(batchesData);
+      if (enrollmentsData) setEnrollments(enrollmentsData);
+      if (paymentsData) setPayments(paymentsData);
+    } catch (err) {
+      console.error("Error fetching data:", err);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const handleUpdateBatchSettings = async () => {
+    setSavingBatch(true);
+    try {
+      const { error } = await supabase
+        .from('chit_groups')
+        .update({ start_date: batchStartDate, due_day: Number(batchDueDay) })
+        .eq('id', selectedBatchId);
+
+      if (error) throw error;
+
+      alert(`✅ Updated Batch Start Date to ${batchStartDate}!`);
+      await fetchData();
+    } catch (err: any) {
+      alert('Error updating batch: ' + err.message);
+    } finally {
+      setSavingBatch(false);
+    }
+  };
+
+  const handleAddMember = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newMember.name || !newMember.phone) return alert('Please enter both name and phone number.');
+
+    const cleanPhone = newMember.phone.trim().replace(/\D/g, '').slice(-10);
+
+    try {
+      let { data: existingMember } = await supabase
+        .from('members')
+        .select('id')
+        .eq('phone_number', cleanPhone)
+        .maybeSingle();
+
+      let memberId = existingMember?.id;
+
+      if (!memberId) {
+        const { data: createdMember, error: mError } = await supabase
+          .from('members')
+          .insert([{ full_name: newMember.name, phone_number: cleanPhone }])
+          .select('id')
+          .single();
+
+        if (mError) throw mError;
+        memberId = createdMember.id;
+      }
+
+      if (newMember.batchId && memberId) {
+        const { data: existingEnrollment } = await supabase
+          .from('group_enrollments')
+          .select('*')
+          .eq('member_id', memberId)
+          .eq('group_id', newMember.batchId)
+          .maybeSingle();
+
+        if (existingEnrollment) {
+          alert('Participant is already enrolled in this batch!');
+        } else {
+          await supabase.from('group_enrollments').insert([
+            { member_id: memberId, group_id: newMember.batchId }
+          ]);
+          alert('✅ Participant added and reflected across Batches!');
+        }
+      }
+
+      setNewMember({ name: '', phone: '', batchId: 'batch-1' });
+      await fetchData();
+    } catch (err: any) {
+      alert('Error: ' + err.message);
+    }
+  };
+
+  const handleMarkCashPaid = async () => {
+    if (!cashPayModal.member) return;
+
+    try {
+      const { error } = await supabase.from('member_payments').insert([
+        {
+          member_id: cashPayModal.member.id,
+          group_id: selectedBatchId,
+          amount_paid: cashAmount,
+          month_number: cashMonth,
+          payment_mode: 'CASH',
+          receipt_utr: `CASH-HAND-${Date.now().toString().slice(-6)}`,
+          status: 'PAID'
+        }
+      ]);
+
+      if (error) throw error;
+
+      alert(`✅ Cash payment of ₹${cashAmount} recorded for Month ${cashMonth}!`);
+      setCashPayModal({ open: false, member: null });
+      await fetchData();
+    } catch (err: any) {
+      alert('Error recording cash payment: ' + err.message);
+    }
+  };
+
+  const sendWhatsApp = (phone: string, name: string) => {
+    if (!phone) return alert('Phone number is missing!');
+    const cleanPhone = phone.replace(/\D/g, '').slice(-10);
+    const host = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000';
+    
+    // Explicit full URL structure guarantees clickable hyperlink formatting in WhatsApp
+    const portalUrl = `${host}/member-portal?phone=${cleanPhone}`;
+
+    const message = `CHIT FUND ACCOUNT STATEMENT
+
+Hello ${name},
+
+Your account statement is ready! Click the link below to view your account details, monthly dues, and paid receipts:
+
+${portalUrl}
+
+Reply HELP if you need assistance.`;
+
+    const whatsappUrl = `https://api.whatsapp.com/send?phone=91${cleanPhone}&text=${encodeURIComponent(message)}`;
+    window.open(whatsappUrl, '_blank');
+  };
+
+  const getMemberPaidStats = (memberId: string, batchId: string) => {
+    const memberPayments = payments.filter(p => p.member_id === memberId && (p.group_id === batchId || !p.group_id));
+    const totalPaid = memberPayments.reduce((acc, curr) => acc + (Number(curr.amount_paid) || 0), 0);
+    const monthsPaidCount = new Set(memberPayments.map(p => p.month_number)).size;
+
+    return { totalPaid, monthsPaidCount, memberPayments };
+  };
+
+  if (loading) {
+    return <div className="min-h-screen bg-slate-900 text-white flex items-center justify-center font-bold">Loading Command Center...</div>;
+  }
+
+  const selectedBatchObj = batches.find(b => b.id === selectedBatchId) || batches[0];
+  const membersInSelectedBatch = enrollments
+    .filter(e => e.group_id === selectedBatchObj?.id)
+    .map(e => members.find(m => m.id === e.member_id))
+    .filter(Boolean);
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
+    <div className="min-h-screen bg-slate-100 font-sans pb-12 text-slate-900">
+      {/* Header */}
+      <header className="bg-slate-900 text-white p-6 shadow-lg">
+        <div className="max-w-7xl mx-auto flex justify-between items-center">
+          <div>
+            <h1 className="text-2xl font-black tracking-tight">CHIT ADMIN COMMAND CENTER</h1>
+            <p className="text-xs text-slate-400">1 Lakh (12-Month) Chit Fund Management System</p>
+          </div>
+          <button onClick={async () => { await supabase.auth.signOut(); router.push('/login'); }} className="bg-red-600 hover:bg-red-700 text-xs font-bold px-4 py-2 rounded-lg text-white">
+            Logout
+          </button>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
+      </header>
+
+      <div className="max-w-7xl mx-auto px-6 mt-8">
+        {/* Navigation Tabs */}
+        <div className="flex gap-4 border-b border-gray-300 pb-4 mb-8">
+          <button onClick={() => setActiveTab('batches')} className={`px-5 py-2.5 rounded-xl font-bold text-sm transition ${activeTab === 'batches' ? 'bg-slate-900 text-white shadow' : 'bg-white text-slate-700 hover:bg-slate-200'}`}>
+            📦 Batches & Members ({batches.length})
+          </button>
+          <button onClick={() => setActiveTab('members')} className={`px-5 py-2.5 rounded-xl font-bold text-sm transition ${activeTab === 'members' ? 'bg-slate-900 text-white shadow' : 'bg-white text-slate-700 hover:bg-slate-200'}`}>
+            👥 All Participants ({members.length})
+          </button>
+          <button onClick={() => setActiveTab('receipts')} className={`px-5 py-2.5 rounded-xl font-bold text-sm transition ${activeTab === 'receipts' ? 'bg-slate-900 text-white shadow' : 'bg-white text-slate-700 hover:bg-slate-200'}`}>
+            🧾 Member Receipts ({payments.length})
+          </button>
         </div>
-      </main>
+
+        {/* TAB 1: BATCHES */}
+        {activeTab === 'batches' && (
+          <div className="space-y-8">
+            {/* Batch Cards */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
+              {batches.map((b) => {
+                const count = enrollments.filter(e => e.group_id === b.id).length;
+                const isSelected = selectedBatchId === b.id;
+                return (
+                  <div key={b.id} onClick={() => setSelectedBatchId(b.id)} className={`cursor-pointer p-5 rounded-2xl border-2 transition ${isSelected ? 'bg-slate-900 text-white border-slate-900 shadow-lg' : 'bg-white text-slate-900 border-gray-200 hover:border-slate-400'}`}>
+                    <div className="flex justify-between items-center">
+                      <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${isSelected ? 'bg-slate-800 text-slate-200' : 'bg-slate-100 text-slate-700'}`}>1 Lakh Chit</span>
+                      <span className="text-[10px] font-bold text-emerald-500">{b.start_date || 'N/A'}</span>
+                    </div>
+                    <h3 className="text-lg font-black mt-2">{b.group_name}</h3>
+                    <p className={`text-xs mt-1 ${isSelected ? 'text-slate-300' : 'text-slate-500'}`}>{count} Enrolled</p>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Selected Batch Details */}
+            {selectedBatchObj && (
+              <div className="bg-white rounded-2xl shadow-sm border border-gray-300 p-6 space-y-6">
+                <div className="flex flex-col md:flex-row justify-between md:items-center pb-6 border-b gap-4">
+                  <div>
+                    <h2 className="text-2xl font-black text-slate-900">{selectedBatchObj.group_name} — Participants</h2>
+                    <p className="text-xs text-slate-500 mt-1">Total Pool: ₹1,00,000 | 12-Month Ledger</p>
+                  </div>
+
+                  {/* Batch Start Date Config */}
+                  <div className="bg-slate-50 p-4 rounded-xl border border-gray-300 flex flex-wrap gap-3 items-end">
+                    <div>
+                      <label className="block text-[10px] font-bold uppercase text-slate-600 mb-1">Batch Start Date</label>
+                      <input
+                        type="date"
+                        value={batchStartDate}
+                        onChange={(e) => setBatchStartDate(e.target.value)}
+                        className="p-2 border border-gray-300 rounded-lg text-xs font-bold bg-white text-slate-900"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] font-bold uppercase text-slate-600 mb-1">Due Day</label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={31}
+                        value={batchDueDay}
+                        onChange={(e) => setBatchDueDay(Number(e.target.value))}
+                        className="p-2 border border-gray-300 rounded-lg text-xs font-bold bg-white text-slate-900 w-20"
+                      />
+                    </div>
+                    <button
+                      onClick={handleUpdateBatchSettings}
+                      disabled={savingBatch}
+                      className="bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold px-4 py-2 rounded-lg"
+                    >
+                      {savingBatch ? 'Saving...' : 'Set Date'}
+                    </button>
+                  </div>
+                </div>
+
+                {/* Participants Table */}
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse">
+                    <thead>
+                      <tr className="border-b border-gray-300 text-xs font-bold text-slate-500 uppercase bg-slate-50">
+                        <th className="py-3 px-4">Participant</th>
+                        <th className="py-3 px-4">Phone Number</th>
+                        <th className="py-3 px-4">Total Paid</th>
+                        <th className="py-3 px-4">Months Cleared</th>
+                        <th className="py-3 px-4">In-Hand Cash</th>
+                        <th className="py-3 px-4">WhatsApp Link</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-200 text-sm">
+                      {membersInSelectedBatch.length === 0 ? (
+                        <tr>
+                          <td colSpan={6} className="py-8 text-center text-slate-500">No participants enrolled in this batch yet.</td>
+                        </tr>
+                      ) : (
+                        membersInSelectedBatch.map((m: any) => {
+                          const stats = getMemberPaidStats(m.id, selectedBatchObj.id);
+                          return (
+                            <tr key={m.id} className="hover:bg-slate-50 transition">
+                              <td className="py-4 px-4 font-bold text-slate-900">
+                                <button onClick={() => setSelectedMember(m)} className="text-indigo-600 hover:underline font-bold text-left">
+                                  {m.full_name} 🔍
+                                </button>
+                              </td>
+                              <td className="py-4 px-4 text-slate-700 font-medium">+91 {m.phone_number}</td>
+                              <td className="py-4 px-4 font-black text-emerald-600">₹{stats.totalPaid.toLocaleString()}</td>
+                              <td className="py-4 px-4">
+                                <span className="bg-slate-100 text-slate-800 text-xs font-bold px-2.5 py-1 rounded-md border border-gray-200">
+                                  {stats.monthsPaidCount} / 12 Months
+                                </span>
+                              </td>
+                              <td className="py-4 px-4">
+                                <button
+                                  onClick={() => setCashPayModal({ open: true, member: m })}
+                                  className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold px-3 py-1.5 rounded-lg shadow-sm"
+                                >
+                                  💵 Mark as Paid
+                                </button>
+                              </td>
+                              <td className="py-4 px-4">
+                                <button
+                                  onClick={() => sendWhatsApp(m.phone_number, m.full_name)}
+                                  className="bg-green-600 hover:bg-green-700 text-white text-xs font-bold px-3 py-1.5 rounded-lg shadow-sm"
+                                >
+                                  📲 Send Link
+                                </button>
+                              </td>
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+
+                {/* Ledger Reference Breakdown */}
+                <div className="pt-6 border-t">
+                  <h3 className="text-xs font-bold uppercase text-slate-600 mb-3">📋 Handwritten Ledger Split-Up Reference</h3>
+                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
+                    {MONTHLY_CHIT_SCHEDULE.map((sch) => (
+                      <div key={sch.month} className="bg-slate-50 border border-gray-200 p-3 rounded-xl text-xs">
+                        <span className="font-black text-slate-900">Month {sch.month}</span>
+                        <div className="mt-1 text-slate-600">Due: <strong className="text-slate-900">₹{sch.duePerPerson}</strong></div>
+                        <div className="text-emerald-700 font-bold mt-0.5">Payout: ₹{sch.winnerPayout.toLocaleString()}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* TAB 2: PARTICIPANTS FORM (HIGH CONTRAST TEXT) */}
+        {activeTab === 'members' && (
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
+            <div className="bg-white p-6 rounded-2xl border border-gray-300 shadow-sm md:col-span-1">
+              <h2 className="text-xl font-black text-slate-900 mb-1">Add Participant</h2>
+              <p className="text-xs text-slate-500 mb-6">Creates participant and adds to batch</p>
+              
+              <form onSubmit={handleAddMember} className="space-y-4">
+                <div>
+                  <label className="block text-xs font-bold uppercase text-slate-700 mb-1">Full Name</label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="Enter full name"
+                    value={newMember.name}
+                    onChange={(e) => setNewMember({ ...newMember, name: e.target.value })}
+                    className="w-full p-3 border border-gray-300 rounded-xl text-slate-900 bg-white focus:ring-2 focus:ring-slate-900 font-medium placeholder-slate-400"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold uppercase text-slate-700 mb-1">Phone Number</label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="10-digit mobile number"
+                    value={newMember.phone}
+                    onChange={(e) => setNewMember({ ...newMember, phone: e.target.value })}
+                    className="w-full p-3 border border-gray-300 rounded-xl text-slate-900 bg-white focus:ring-2 focus:ring-slate-900 font-medium placeholder-slate-400"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold uppercase text-slate-700 mb-1">Assign Batch</label>
+                  <select
+                    value={newMember.batchId}
+                    onChange={(e) => setNewMember({ ...newMember, batchId: e.target.value })}
+                    className="w-full p-3 border border-gray-300 rounded-xl text-slate-900 bg-white focus:ring-2 focus:ring-slate-900 font-medium"
+                  >
+                    {batches.map((b) => (
+                      <option key={b.id} value={b.id}>{b.group_name} ({b.start_date || 'N/A'})</option>
+                    ))}
+                  </select>
+                </div>
+
+                <button type="submit" className="w-full bg-slate-900 hover:bg-slate-800 text-white font-bold py-3.5 rounded-xl shadow-md transition mt-4">
+                  Save Participant
+                </button>
+              </form>
+            </div>
+
+            <div className="bg-white p-6 rounded-2xl border border-gray-300 shadow-sm md:col-span-2">
+              <h2 className="text-xl font-black text-slate-900 mb-4">Participant Directory ({members.length})</h2>
+              <div className="divide-y divide-gray-200">
+                {members.map((m) => {
+                  const enrolledBatches = enrollments
+                    .filter(e => e.member_id === m.id)
+                    .map(e => batches.find(b => b.id === e.group_id)?.group_name)
+                    .filter(Boolean);
+
+                  return (
+                    <div key={m.id} className="py-4 flex justify-between items-center">
+                      <div>
+                        <p className="font-bold text-slate-900 text-base">{m.full_name}</p>
+                        <p className="text-xs text-slate-500">📱 +91 {m.phone_number}</p>
+                        <div className="flex gap-1.5 mt-1">
+                          {enrolledBatches.map((bName, idx) => (
+                            <span key={idx} className="text-[10px] bg-slate-100 text-slate-700 font-bold px-2 py-0.5 rounded border">
+                              {bName}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => sendWhatsApp(m.phone_number, m.full_name)}
+                        className="bg-green-600 hover:bg-green-700 text-white text-xs font-bold px-3 py-1.5 rounded-lg"
+                      >
+                        📲 Send Link
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* TAB 3: RECEIPTS */}
+        {activeTab === 'receipts' && (
+          <div className="bg-white p-6 rounded-2xl border border-gray-300 shadow-sm">
+            <h2 className="text-xl font-black text-slate-900 mb-4">Member Receipts History ({payments.length})</h2>
+            <div className="divide-y divide-gray-200">
+              {payments.map((p) => (
+                <div key={p.id} className="py-3 flex justify-between items-center">
+                  <div>
+                    <p className="font-bold text-slate-900">{p.members?.full_name || 'Member'}</p>
+                    <p className="text-xs text-slate-500">
+                      Month {p.month_number} • Mode: <span className="font-bold text-slate-700">{p.payment_mode || 'UPI'}</span> • UTR: {p.receipt_utr}
+                    </p>
+                  </div>
+                  <p className="font-black text-emerald-600 text-base">₹{p.amount_paid?.toLocaleString()}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* MARK CASH PAID MODAL */}
+      {cashPayModal.open && cashPayModal.member && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-white p-6 rounded-2xl max-w-md w-full shadow-2xl border border-gray-300">
+            <h3 className="text-lg font-black text-slate-900">💵 Record Cash Payment</h3>
+            <p className="text-xs text-slate-500 mt-0.5">Member: <strong>{cashPayModal.member.full_name}</strong></p>
+
+            <div className="space-y-4 mt-4">
+              <div>
+                <label className="block text-xs font-bold uppercase text-slate-700 mb-1">Select Month</label>
+                <select
+                  value={cashMonth}
+                  onChange={(e) => {
+                    const m = Number(e.target.value);
+                    setCashMonth(m);
+                    setCashAmount(MONTHLY_CHIT_SCHEDULE[m - 1]?.duePerPerson || 6500);
+                  }}
+                  className="w-full p-3 border rounded-xl text-slate-900 font-medium bg-white"
+                >
+                  {MONTHLY_CHIT_SCHEDULE.map((s) => (
+                    <option key={s.month} value={s.month}>Month {s.month} (Due: ₹{s.duePerPerson})</option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold uppercase text-slate-700 mb-1">Amount Collected (₹)</label>
+                <input
+                  type="number"
+                  value={cashAmount}
+                  onChange={(e) => setCashAmount(Number(e.target.value))}
+                  className="w-full p-3 border rounded-xl text-slate-900 font-bold text-lg bg-white"
+                />
+              </div>
+
+              <div className="flex gap-3 mt-6">
+                <button onClick={() => setCashPayModal({ open: false, member: null })} className="w-1/2 bg-gray-200 text-slate-800 font-bold py-3 rounded-xl">
+                  Cancel
+                </button>
+                <button onClick={handleMarkCashPaid} className="w-1/2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-3 rounded-xl">
+                  Confirm Paid
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MEMBER DRILL DOWN MODAL */}
+      {selectedMember && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-white p-6 rounded-2xl max-w-lg w-full shadow-2xl border border-gray-300">
+            <div className="flex justify-between items-center border-b pb-3">
+              <div>
+                <h3 className="text-xl font-black text-slate-900">{selectedMember.full_name}</h3>
+                <p className="text-xs text-slate-500">📱 +91 {selectedMember.phone_number}</p>
+              </div>
+              <button onClick={() => setSelectedMember(null)} className="text-gray-400 hover:text-slate-900 font-bold text-lg">✕</button>
+            </div>
+
+            <div className="mt-4 space-y-3 max-h-96 overflow-y-auto pr-1">
+              <h4 className="text-xs font-bold text-slate-500 uppercase">Payment Receipts</h4>
+              {payments.filter(p => p.member_id === selectedMember.id).length === 0 ? (
+                <p className="text-xs text-slate-500 py-4 text-center">No payment receipts uploaded yet.</p>
+              ) : (
+                payments.filter(p => p.member_id === selectedMember.id).map((p) => (
+                  <div key={p.id} className="p-3 border rounded-xl bg-slate-50 flex justify-between items-center">
+                    <div>
+                      <span className="text-xs font-bold text-slate-900">Month {p.month_number}</span>
+                      <p className="text-[11px] text-slate-500">Mode: {p.payment_mode || 'UPI'} • {p.receipt_utr}</p>
+                    </div>
+                    <span className="font-black text-emerald-600 text-sm">₹{p.amount_paid?.toLocaleString()}</span>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <button onClick={() => setSelectedMember(null)} className="w-full mt-6 bg-slate-900 text-white font-bold py-3 rounded-xl">
+              Close
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
