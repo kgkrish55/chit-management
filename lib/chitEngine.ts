@@ -11,6 +11,11 @@ function ordinalSuffix(n: number): string {
   return s[(v - 20) % 10] || s[v] || s[0];
 }
 
+function toWhatsAppNumber(phone: string): string {
+  const digits = phone.replace(/\D/g, '');
+  return digits.startsWith('91') ? digits : `91${digits}`;
+}
+
 export function generateMemberStatement(
   memberName: string,
   phone: string,
@@ -45,6 +50,6 @@ Tap an action below to proceed:`;
   return {
     totalConsolidatedDue,
     whatsappMessage,
-    whatsappUrl: `https://wa.me/91${phone.replace(/\D/g, '')}?text=${encodeURIComponent(whatsappMessage)}`
+    whatsappUrl: `https://wa.me/${toWhatsAppNumber(phone)}?text=${encodeURIComponent(whatsappMessage)}`
   };
 }

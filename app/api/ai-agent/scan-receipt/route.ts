@@ -1,24 +1,38 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { GoogleGenAI, createPartFromBase64 } from '@google/genai';
 import { supabaseAdmin } from '@/lib/supabaseAdmin';
+import {
+  MONTHLY_DUE,
+  computePaymentStatus,
+  extractAmountFromText,
+  extractMonthFromText,
+  extractUtrFromText,
+  normalizeMonthNumber,
+  parseScannedJson,
+} from '@/lib/paymentScanner';
+import {
+  ScanOutcome,
+  buildReceiptUtr,
+  computeRemainingDue,
+  dedupeUploads,
+  formatINR,
+  sha256Hex,
+} from '@/lib/paymentProcessing';
 
-const MONTHLY_DUE: Record<number, number> = {
-  1: 6500,
-  2: 6600,
-  3: 6750,
-  4: 7000,
-  5: 7100,
-  6: 7350,
-  7: 7600,
-  8: 7800,
-  9: 8100,
-  10: 8350,
-  11: 8600,
-  12: 8750,
-};
+const DEFAULT_MODELS = ['gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-2.5-flash'];
+const MAX_FILES = 5;
+const MAX_FILE_BYTES = 10 * 1024 * 1024;
+
+const SCAN_PROMPT = `Analyze this payment receipt screenshot and return ONLY valid JSON with no markdown.
+Schema: {"amount": <number>, "month": <number>, "utr": <string>}
+- amount: the exact numeric amount paid in Indian Rupees (no commas, no currency symbol).
+- month: the chit month number if visible in the text, otherwise 1.
+- utr: the payment reference / UTR / transaction reference number if visible, otherwise "".`;
 
 interface ScanResult {
   amount: number;
   month: number;
+  utr: string | null;
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | null> {
@@ -37,83 +51,62 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | null> {
   });
 }
 
+function getGeminiModels(): string[] {
+  const configured = (process.env.GEMINI_MODEL || '')
+    .split(',')
+    .map((m) => m.trim())
+    .filter(Boolean);
+  return configured.length > 0 ? configured : DEFAULT_MODELS;
+}
+
 async function scanWithGemini(base64Image: string, mimeType: string): Promise<ScanResult | null> {
   const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return null;
 
-  // Gemini keys start with "AIza"; anything else is not usable with this API.
-  if (!apiKey || !apiKey.startsWith('AIza')) {
-    return null;
-  }
+  const ai = new GoogleGenAI({
+    apiKey,
+    httpOptions: { timeout: 12000 },
+  });
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 12000);
-
-  try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: controller.signal,
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [
-                {
-                  text: `Analyze this payment receipt screenshot and return ONLY valid JSON with no markdown.
-Schema: {"amount": <number>, "month": <number>}
-- amount: the exact numeric amount paid in Indian Rupees (no commas, no currency symbol).
-- month: the chit month number if visible in the text, otherwise 1.`,
-                },
-                {
-                  inline_data: {
-                    mime_type: mimeType || 'image/jpeg',
-                    data: base64Image,
-                  },
-                },
-              ],
-            },
-          ],
-          generationConfig: {
-            response_mime_type: 'application/json',
+  for (const model of getGeminiModels()) {
+    try {
+      const response = await ai.models.generateContent({
+        model,
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              { text: SCAN_PROMPT },
+              createPartFromBase64(base64Image, mimeType || 'image/jpeg'),
+            ],
           },
-        }),
+        ],
+        config: { responseMimeType: 'application/json' },
+      });
+
+      const raw = response.text || '';
+      const parsed = parseScannedJson(raw);
+      if (parsed && parsed.amount !== null) {
+        return { amount: parsed.amount, month: parsed.month, utr: parsed.utr };
       }
-    );
-
-    if (!response.ok) {
-      console.error('Gemini API Non-OK Response:', response.status, await response.text());
-      return null;
+      console.error(`Gemini model ${model} returned no usable amount:`, raw.slice(0, 200));
+    } catch (err) {
+      console.error(`Gemini model ${model} OCR Error:`, err instanceof Error ? err.message : err);
     }
-
-    const aiData = await response.json();
-    const responseText = aiData?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    const cleanJson = responseText.replace(/```json|```/g, '').trim();
-
-    if (!cleanJson) return null;
-
-    const parsed = JSON.parse(cleanJson) as { amount?: unknown; month?: unknown };
-    const amount = Number(parsed.amount);
-    const month = Number(parsed.month);
-
-    if (!Number.isFinite(amount) || amount <= 0) return null;
-    return {
-      amount: Math.round(amount),
-      month: Number.isFinite(month) && month >= 1 && month <= 12 ? Math.round(month) : 1,
-    };
-  } catch (err) {
-    console.error('Gemini Fetch OCR Error:', err);
-    return null;
-  } finally {
-    clearTimeout(timer);
   }
+
+  return null;
 }
 
 async function scanWithTesseract(buffer: Buffer): Promise<ScanResult | null> {
   try {
     const Tesseract = (await import('tesseract.js')).default;
     const result = await withTimeout(
-      Tesseract.recognize(buffer, 'eng', { logger: () => {} }),
+      Tesseract.recognize(buffer, 'eng', {
+        langPath: `${process.cwd()}/public/tessdata`,
+        gzip: true,
+        logger: () => {},
+      }),
       8000
     );
     if (!result) {
@@ -121,59 +114,70 @@ async function scanWithTesseract(buffer: Buffer): Promise<ScanResult | null> {
       return null;
     }
     const text = result.data.text || '';
-
-    // Prefer amounts written with a currency symbol, else the largest number.
-    const currencyMatches = [...text.matchAll(/(?:₹|Rs\.?|INR)\s*([\d,]+(?:\.\d{1,2})?)/gi)];
-    const allNumbers = [...text.matchAll(/\b(\d{2,6}(?:,\d{3})*)\b/g)].map(
-      (m) => Number(m[1].replace(/,/g, ''))
-    );
-
-    let amount = 0;
-    if (currencyMatches.length > 0) {
-      const candidate = Number(currencyMatches[0][1].replace(/,/g, ''));
-      if (Number.isFinite(candidate) && candidate > 0) amount = candidate;
-    } else if (allNumbers.length > 0) {
-      amount = Math.max(...allNumbers);
-    }
-
+    const amount = extractAmountFromText(text);
     if (amount <= 0) return null;
-
-    const monthMatch = text.match(/(?:month|instalment|installment)\s*[#:]*\s*(\d{1,2})/i);
-    const month = monthMatch ? Number(monthMatch[1]) : 1;
 
     return {
       amount,
-      month: month >= 1 && month <= 12 ? month : 1,
+      month: extractMonthFromText(text),
+      utr: extractUtrFromText(text),
     };
   } catch (err) {
-    console.error('Tesseract OCR Error:', err);
+    console.error('Tesseract OCR Error:', err instanceof Error ? err.message : err);
     return null;
   }
+}
+
+async function collectFiles(formData: FormData): Promise<File[]> {
+  const files: File[] = [];
+  const direct = formData.get('file');
+  if (direct instanceof File) files.push(direct);
+  const multi = formData.getAll('files');
+  for (const f of multi) {
+    if (f instanceof File) files.push(f);
+  }
+
+  const seen = new Set<string>();
+  return files.filter((f) => {
+    const key = `${f.name}:${f.size}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 export async function POST(req: NextRequest) {
   try {
     const formData = await req.formData();
-    const file = formData.get('file') as File | null;
     const memberId = (formData.get('memberId') as string) || '';
     const requestedMonth = Number(formData.get('month')) || 1;
 
-    if (!file) {
+    const files = await collectFiles(formData);
+
+    if (files.length === 0) {
       return NextResponse.json({ success: false, error: 'No file provided' }, { status: 400 });
     }
 
-    if (!file.type.startsWith('image/')) {
+    if (files.length > MAX_FILES) {
       return NextResponse.json(
-        { success: false, error: 'Please upload an image file (PNG/JPG)' },
+        { success: false, error: `You can upload a maximum of ${MAX_FILES} screenshots at once.` },
         { status: 400 }
       );
     }
 
-    if (file.size > 10 * 1024 * 1024) {
-      return NextResponse.json(
-        { success: false, error: 'Image is too large. Maximum size is 10 MB.' },
-        { status: 400 }
-      );
+    for (const file of files) {
+      if (!file.type.startsWith('image/')) {
+        return NextResponse.json(
+          { success: false, error: `"${file.name}" is not an image file (PNG/JPG only).` },
+          { status: 400 }
+        );
+      }
+      if (file.size > MAX_FILE_BYTES) {
+        return NextResponse.json(
+          { success: false, error: `"${file.name}" is too large. Maximum size is 10 MB per image.` },
+          { status: 400 }
+        );
+      }
     }
 
     // Resolve and validate the member before touching the database.
@@ -202,33 +206,87 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const bytes = await file.arrayBuffer();
-    const buffer = Buffer.from(bytes);
-    const base64Image = buffer.toString('base64');
+    // Scan every uploaded screenshot.
+    const scanned: ScanOutcome[] = [];
+    const failures: { fileName: string; reason: string }[] = [];
 
-    let result = await scanWithGemini(base64Image, file.type);
-    if (!result) {
-      result = await scanWithTesseract(buffer);
+    for (const file of files) {
+      const bytes = await file.arrayBuffer();
+      const buffer = Buffer.from(bytes);
+      const imageHash = sha256Hex(buffer);
+      const base64Image = buffer.toString('base64');
+
+      let result = await scanWithGemini(base64Image, file.type);
+      if (!result) result = await scanWithTesseract(buffer);
+
+      if (!result) {
+        failures.push({
+          fileName: file.name,
+          reason: 'Could not read the amount from this screenshot.',
+        });
+        continue;
+      }
+
+      scanned.push({
+        fileName: file.name,
+        amount: result.amount,
+        month: normalizeMonthNumber(result.month, requestedMonth),
+        utr: result.utr,
+        imageHash,
+      });
     }
 
-    if (!result) {
+    if (scanned.length === 0) {
       return NextResponse.json(
         {
           success: false,
-          error: 'Could not read the amount from this screenshot. Please try a clearer image.',
+          error:
+            failures.length > 0
+              ? failures[0].reason
+              : 'Could not read the amount from these screenshots. Please try clearer images.',
         },
         { status: 422 }
       );
     }
 
-    const monthNumber =
-      result.month >= 1 && result.month <= 12 && result.month !== 1
-        ? result.month
-        : requestedMonth >= 1 && requestedMonth <= 12
-        ? requestedMonth
-        : result.month;
-    const scannedAmount = result.amount;
-    const dueForMonth = MONTHLY_DUE[monthNumber] || MONTHLY_DUE[1];
+    // Reject duplicates already present in this upload batch.
+    const { unique, duplicates: batchDuplicates } = dedupeUploads(scanned);
+
+    // Reject screenshots whose receipt reference was already recorded.
+    const keys = unique.map((s) => buildReceiptUtr(s.utr, s.imageHash));
+    const { data: existingRows } = await supabaseAdmin
+      .from('member_payments')
+      .select('receipt_utr')
+      .eq('member_id', member.id)
+      .in('receipt_utr', keys);
+
+    const existingUtrs = new Set((existingRows || []).map((r) => r.receipt_utr));
+    const dbDuplicates = unique.filter((s) => existingUtrs.has(buildReceiptUtr(s.utr, s.imageHash)));
+    const toInsert = unique.filter((s) => !existingUtrs.has(buildReceiptUtr(s.utr, s.imageHash)));
+
+    if (toInsert.length === 0) {
+      return NextResponse.json(
+        {
+          success: false,
+          error:
+            'This screenshot was already recorded. Please upload a different screenshot (check your UTR / reference number).',
+          duplicateCount: batchDuplicates.length + dbDuplicates.length,
+        },
+        { status: 409 }
+      );
+    }
+
+    // Existing per-month totals for this member (for status + remaining due).
+    const { data: priorPayments } = await supabaseAdmin
+      .from('member_payments')
+      .select('month_number, amount_paid')
+      .eq('member_id', member.id);
+
+    const paidPerMonth = new Map<number, number>();
+    for (const p of priorPayments || []) {
+      const m = Number(p.month_number);
+      paidPerMonth.set(m, (paidPerMonth.get(m) || 0) + (Number(p.amount_paid) || 0));
+    }
 
     // Attach the member's primary batch if they have one.
     const { data: enrollment } = await supabaseAdmin
@@ -238,32 +296,103 @@ export async function POST(req: NextRequest) {
       .limit(1)
       .maybeSingle();
 
-    const { error: paymentError } = await supabaseAdmin.from('member_payments').insert([
-      {
-        member_id: member.id,
-        group_id: enrollment?.group_id || null,
-        amount_paid: scannedAmount,
-        month_number: monthNumber,
-        payment_mode: 'UPI',
-        receipt_utr: `UPI-${Date.now().toString().slice(-8)}`,
-        status: scannedAmount >= dueForMonth ? 'PAID' : 'PARTIAL',
-      },
-    ]);
+    const groupId = enrollment?.group_id || null;
 
-    if (paymentError) {
-      console.error('Payment insert error:', paymentError);
-      return NextResponse.json(
-        { success: false, error: paymentError.message },
-        { status: 500 }
-      );
+    // New totals per month coming from this batch (drives per-row status).
+    const monthNewTotals = new Map<number, number>();
+    for (const scan of toInsert) {
+      monthNewTotals.set(scan.month, (monthNewTotals.get(scan.month) || 0) + scan.amount);
     }
+
+    const inserted: Array<{
+      month_number: number;
+      amount_paid: number;
+      receipt_utr: string;
+      status: string;
+    }> = [];
+
+    for (const scan of toInsert) {
+      const utr = buildReceiptUtr(scan.utr, scan.imageHash);
+      const finalMonthTotal = (paidPerMonth.get(scan.month) || 0) + (monthNewTotals.get(scan.month) || 0);
+      const status = computePaymentStatus(finalMonthTotal, scan.month);
+
+      const { data, error } = await supabaseAdmin
+        .from('member_payments')
+        .insert([
+          {
+            member_id: member.id,
+            group_id: groupId,
+            amount_paid: scan.amount,
+            month_number: scan.month,
+            payment_mode: 'UPI',
+            receipt_utr: utr,
+            status,
+          },
+        ])
+        .select('month_number, amount_paid, receipt_utr, status')
+        .single();
+
+      if (error) {
+        console.error('Payment insert error:', error);
+        return NextResponse.json(
+          { success: false, error: error.message },
+          { status: 500 }
+        );
+      }
+      inserted.push(data);
+    }
+
+    const recordedAmount = inserted.reduce((sum, p) => sum + (Number(p.amount_paid) || 0), 0);
+    const allDuplicates = [...batchDuplicates, ...dbDuplicates];
+
+    // Build a human-friendly summary.
+    const monthNumbers = [...new Set(inserted.map((p) => p.month_number))].sort((a, b) => a - b);
+    const monthLabel =
+      monthNumbers.length === 1 ? `Month ${monthNumbers[0]}` : `Months ${monthNumbers.join(', ')}`;
+
+    let message: string;
+    if (monthNumbers.length === 1) {
+      const month = monthNumbers[0];
+      const due = MONTHLY_DUE[month] || MONTHLY_DUE[1];
+      const remaining = computeRemainingDue(
+        due,
+        paidPerMonth.get(month) || 0,
+        monthNewTotals.get(month) || 0
+      );
+      message =
+        remaining === 0
+          ? `Month ${month} is now fully paid! 🎉 (₹${formatINR(due)})`
+          : `Recorded ₹${formatINR(recordedAmount)} for ${monthLabel}. Still due ₹${formatINR(remaining)}.`;
+    } else {
+      message = `Recorded ₹${formatINR(recordedAmount)} for ${monthLabel}.`;
+    }
+
+    if (allDuplicates.length > 0) {
+      message += ` Skipped ${allDuplicates.length} duplicate screenshot(s).`;
+    }
+    if (failures.length > 0) {
+      message += ` Could not read ${failures.length} screenshot(s).`;
+    }
+
+    const remainingDue =
+      monthNumbers.length === 1
+        ? computeRemainingDue(
+            MONTHLY_DUE[monthNumbers[0]] || MONTHLY_DUE[1],
+            paidPerMonth.get(monthNumbers[0]) || 0,
+            monthNewTotals.get(monthNumbers[0]) || 0
+          )
+        : null;
 
     return NextResponse.json({
       success: true,
-      message: `Receipt scanned! Recorded ₹${scannedAmount.toLocaleString('en-IN')} for Month ${monthNumber}.`,
+      message,
       memberId: member.id,
-      amount: scannedAmount,
-      month: monthNumber,
+      amount: recordedAmount,
+      month: monthNumbers.length === 1 ? monthNumbers[0] : monthNumbers,
+      remainingDue,
+      recordedCount: inserted.length,
+      skippedDuplicates: allDuplicates.map((d) => d.fileName),
+      unreadable: failures.map((f) => f.fileName),
     });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Internal Server Error';
