@@ -138,6 +138,9 @@ export default function AdminDashboard() {
   const [selectedBatchId, setSelectedBatchId] = useState<string>('');
   const [selectedMember, setSelectedMember] = useState<Member | null>(null);
 
+  const [showCreateBatch, setShowCreateBatch] = useState(false);
+  const [newBatch, setNewBatch] = useState({ group_name: '', batch_name: '', start_date: '2025-01-10', due_day: 10, total_pool_amount: 100000, total_members: 20, total_months: 12, current_cycle: 1 });
+
   // Form & Cash Payment States
   const [newMember, setNewMember] = useState({ name: '', phone: '', batchId: '' });
   const [cashPayModal, setCashPayModal] = useState<{ open: boolean; member: Member | null }>({ open: false, member: null });
@@ -260,6 +263,33 @@ export default function AdminDashboard() {
       await fetchData();
     } catch (err) {
       alert('Error: ' + getErrorMessage(err));
+    }
+  };
+
+  const handleCreateBatch = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newBatch.group_name || !newBatch.batch_name) return alert('Please enter Group Name and Batch Name.');
+
+    try {
+      const { error } = await supabase.from('chit_groups').insert([{
+        group_name: newBatch.group_name,
+        batch_name: newBatch.batch_name,
+        start_date: newBatch.start_date,
+        due_day: Number(newBatch.due_day),
+        total_pool_amount: Number(newBatch.total_pool_amount),
+        total_members: Number(newBatch.total_members),
+        total_months: Number(newBatch.total_months),
+        current_cycle: Number(newBatch.current_cycle),
+      }]);
+
+      if (error) throw error;
+
+      alert(`✅ Batch "${newBatch.group_name}" created successfully!`);
+      setShowCreateBatch(false);
+      setNewBatch({ group_name: '', batch_name: '', start_date: '2025-01-10', due_day: 10, total_pool_amount: 100000, total_members: 20, total_months: 12, current_cycle: 1 });
+      await fetchData();
+    } catch (err) {
+      alert('Error creating batch: ' + getErrorMessage(err));
     }
   };
 
@@ -459,6 +489,17 @@ Reply HELP if you need assistance.`;
                   </div>
                 );
               })}
+              {/* Create New Batch Card */}
+              <div
+                onClick={() => setShowCreateBatch(true)}
+                className="cursor-pointer p-5 rounded-2xl border-2 border-dashed border-slate-300 hover:border-emerald-400 hover:bg-emerald-50 transition-all flex flex-col items-center justify-center min-h-[180px] gap-3"
+              >
+                <div className="w-14 h-14 rounded-full border-2 border-dashed border-slate-300 flex items-center justify-center text-slate-400 hover:text-emerald-500 transition-colors">
+                  <svg className="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>
+                </div>
+                <span className="text-sm font-bold text-slate-600">Create Batch</span>
+                <span className="text-[10px] text-slate-400">Add new chit group</span>
+              </div>
             </div>
 
             {/* Selected Batch Details */}
@@ -767,6 +808,128 @@ Reply HELP if you need assistance.`;
             <button onClick={() => setSelectedMember(null)} className="w-full mt-6 bg-slate-900 text-white font-bold py-3 rounded-xl hover:bg-slate-800 transition">
               Close
             </button>
+          </div>
+        </div>
+      )}
+
+      {/* CREATE BATCH MODAL */}
+      {showCreateBatch && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-white p-6 rounded-2xl max-w-md w-full shadow-2xl border border-slate-200">
+            <h3 className="text-lg font-black text-slate-900">➕ Create New Batch</h3>
+            <p className="text-xs text-slate-500 mt-0.5 mb-4">Fill in the details to create a new chit group</p>
+
+            <form onSubmit={handleCreateBatch} className="space-y-4">
+              <div>
+                <label className="block text-xs font-bold uppercase text-slate-700 mb-1">Group Name</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="e.g., Batch F - Jun 2025"
+                  value={newBatch.group_name}
+                  onChange={(e) => setNewBatch({ ...newBatch, group_name: e.target.value })}
+                  className="w-full p-3 border border-slate-200 rounded-xl text-slate-900 bg-white focus:ring-2 focus:ring-emerald-500 font-medium placeholder-slate-400 outline-none"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold uppercase text-slate-700 mb-1">Batch Name</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="e.g., Batch F"
+                  value={newBatch.batch_name}
+                  onChange={(e) => setNewBatch({ ...newBatch, batch_name: e.target.value })}
+                  className="w-full p-3 border border-slate-200 rounded-xl text-slate-900 bg-white focus:ring-2 focus:ring-emerald-500 font-medium placeholder-slate-400 outline-none"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-bold uppercase text-slate-700 mb-1">Start Date</label>
+                  <input
+                    type="date"
+                    required
+                    value={newBatch.start_date}
+                    onChange={(e) => setNewBatch({ ...newBatch, start_date: e.target.value })}
+                    className="w-full p-3 border border-slate-200 rounded-xl text-slate-900 bg-white focus:ring-2 focus:ring-emerald-500 font-medium outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-bold uppercase text-slate-700 mb-1">Due Day</label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="31"
+                    required
+                    value={newBatch.due_day}
+                    onChange={(e) => setNewBatch({ ...newBatch, due_day: Number(e.target.value) })}
+                    className="w-full p-3 border border-slate-200 rounded-xl text-slate-900 bg-white focus:ring-2 focus:ring-emerald-500 font-medium outline-none"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-bold uppercase text-slate-700 mb-1">Pool Amount (₹)</label>
+                  <input
+                    type="number"
+                    min="1000"
+                    required
+                    value={newBatch.total_pool_amount}
+                    onChange={(e) => setNewBatch({ ...newBatch, total_pool_amount: Number(e.target.value) })}
+                    className="w-full p-3 border border-slate-200 rounded-xl text-slate-900 bg-white focus:ring-2 focus:ring-emerald-500 font-medium outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-bold uppercase text-slate-700 mb-1">Total Members</label>
+                  <input
+                    type="number"
+                    min="2"
+                    max="50"
+                    required
+                    value={newBatch.total_members}
+                    onChange={(e) => setNewBatch({ ...newBatch, total_members: Number(e.target.value) })}
+                    className="w-full p-3 border border-slate-200 rounded-xl text-slate-900 bg-white focus:ring-2 focus:ring-emerald-500 font-medium outline-none"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-bold uppercase text-slate-700 mb-1">Total Months</label>
+                  <input
+                    type="number"
+                    min="6"
+                    max="24"
+                    required
+                    value={newBatch.total_months}
+                    onChange={(e) => setNewBatch({ ...newBatch, total_months: Number(e.target.value) })}
+                    className="w-full p-3 border border-slate-200 rounded-xl text-slate-900 bg-white focus:ring-2 focus:ring-emerald-500 font-medium outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-bold uppercase text-slate-700 mb-1">Current Cycle</label>
+                  <input
+                    type="number"
+                    min="1"
+                    required
+                    value={newBatch.current_cycle}
+                    onChange={(e) => setNewBatch({ ...newBatch, current_cycle: Number(e.target.value) })}
+                    className="w-full p-3 border border-slate-200 rounded-xl text-slate-900 bg-white focus:ring-2 focus:ring-emerald-500 font-medium outline-none"
+                  />
+                </div>
+              </div>
+
+              <div className="flex gap-3 mt-6">
+                <button type="button" onClick={() => setShowCreateBatch(false)} className="w-1/2 bg-slate-200 text-slate-800 font-bold py-3 rounded-xl hover:bg-slate-300 transition">
+                  Cancel
+                </button>
+                <button type="submit" className="w-1/2 bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-white font-bold py-3 rounded-xl shadow-md transition">
+                  Create Batch
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

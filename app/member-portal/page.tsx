@@ -93,43 +93,82 @@ function MemberPortalInner() {
           .eq('phone_number', phone)
           .maybeSingle();
 
-        if (memberError) throw memberError;
+        if (memberError) {
+          console.error('Supabase member query error:', {
+            message: memberError.message,
+            details: memberError.details,
+            hint: memberError.hint,
+            code: memberError.code,
+          });
+          throw memberError;
+        }
 
         if (!memberData) {
           setError('No account found for this phone number. Please contact the admin.');
+          setMember(null);
+          setPayments([]);
+          setBatchNames([]);
           return;
         }
 
         setMember(memberData);
 
-        const { data: enrollments } = await supabase
+        const { data: enrollments, error: enrollmentsError } = await supabase
           .from('group_enrollments')
           .select('group_id')
           .eq('member_id', memberData.id);
 
+        if (enrollmentsError) {
+          console.error('Supabase enrollments query error:', {
+            message: enrollmentsError.message,
+            details: enrollmentsError.details,
+            hint: enrollmentsError.hint,
+            code: enrollmentsError.code,
+          });
+        }
+
         const groupIds = (enrollments || []).map((e) => e.group_id);
         if (groupIds.length > 0) {
-          const { data: groups } = await supabase
+          const { data: groups, error: groupsError } = await supabase
             .from('chit_groups')
             .select('group_name')
             .in('id', groupIds);
+
+          if (groupsError) {
+            console.error('Supabase chit_groups query error:', {
+              message: groupsError.message,
+              details: groupsError.details,
+              hint: groupsError.hint,
+              code: groupsError.code,
+            });
+          }
           setBatchNames((groups || []).map((g) => g.group_name));
+        } else {
+          setBatchNames([]);
         }
 
         const paymentData = await loadPayments(memberData.id);
-        setPayments(paymentData);
+        setPayments(paymentData || []);
 
         const nextUnpaid =
           MONTHLY_CHIT_SCHEDULE.find((s) => {
-            const monthSum = paymentData
+            const monthSum = (paymentData || [])
               .filter((p) => p.month_number === s.month)
               .reduce((sum, p) => sum + (Number(p.amount_paid) || 0), 0);
             return monthSum < s.due;
           }) || MONTHLY_CHIT_SCHEDULE[0];
         setSelectedMonth(nextUnpaid.month);
       } catch (err) {
-        console.error('Database fetch error:', err);
+        const errorDetails = err instanceof Error ? {
+          message: err.message,
+          stack: err.stack,
+          name: err.name,
+        } : { message: String(err) };
+        console.error('Database fetch error in loadMemberData:', errorDetails);
         setError('Could not load your account. Please try again later.');
+        setMember(null);
+        setPayments([]);
+        setBatchNames([]);
       } finally {
         setLoading(false);
       }
